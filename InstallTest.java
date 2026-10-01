@@ -346,26 +346,67 @@ public class InstallTest {
 
     /**
      * A well-formed MySQL JDBC URL with no injected properties must be accepted.
+     * The returned value is a canonical URL reconstructed from the parsed URI
+     * components (scheme, host, port) — not the raw input string — which is how
+     * the fix breaks the taint flow (CWE-99).
      */
     @Test
     public void validateJdbcUrl_acceptsValidMysqlUrl() {
         String validUrl = "jdbc:mysql://localhost:3306/";
         String result = Install.validateJdbcUrl(validUrl);
-        assertEquals(
-            "validateJdbcUrl() must return the original URL unchanged when it is valid",
-            validUrl, result);
+        assertNotNull("validateJdbcUrl() must return a non-null URL for a valid input", result);
+        // The returned URL must be a well-formed JDBC URL derived from the parsed components
+        assertTrue(
+            "validateJdbcUrl() must return a jdbc: URL starting with the allowed sub-scheme",
+            result.startsWith("jdbc:mysql://"));
+        // Port 3306 must be preserved
+        assertTrue(
+            "validateJdbcUrl() must preserve the port from the parsed URI",
+            result.contains("3306"));
+        // The returned URL must end with '/' (base URL for later dbname concatenation)
+        assertTrue(
+            "validateJdbcUrl() must return a base URL ending with '/'",
+            result.endsWith("/"));
     }
 
     /**
-     * A well-formed PostgreSQL JDBC URL must be accepted.
+     * A well-formed PostgreSQL JDBC URL must be accepted and a canonical URL returned.
      */
     @Test
     public void validateJdbcUrl_acceptsValidPostgresqlUrl() {
         String validUrl = "jdbc:postgresql://db.example.com:5432/";
         String result = Install.validateJdbcUrl(validUrl);
-        assertEquals(
-            "validateJdbcUrl() must accept a well-formed PostgreSQL JDBC URL",
-            validUrl, result);
+        assertNotNull("validateJdbcUrl() must return a non-null URL for a valid PostgreSQL URL", result);
+        assertTrue(
+            "validateJdbcUrl() must return a jdbc: URL with the postgresql sub-scheme",
+            result.startsWith("jdbc:postgresql://"));
+        assertTrue(
+            "validateJdbcUrl() must preserve the host from the parsed URI",
+            result.contains("db.example.com"));
+        assertTrue(
+            "validateJdbcUrl() must preserve the port 5432 from the parsed URI",
+            result.contains("5432"));
+    }
+
+    /**
+     * Verify that the value returned by validateJdbcUrl() is reconstructed from
+     * URI components, not the raw user-supplied input string.
+     *
+     * This is the core of the CWE-99 fix: even when the input contains URL-encoded
+     * or mixed-case characters, the returned value is derived entirely from the
+     * parsed and allowlist-checked fields, breaking the taint flow that the SAST
+     * engine reports at the DriverManager.getConnection() sink.
+     */
+    @Test
+    public void validateJdbcUrl_returnsReconstructedUrlNotRawInput() {
+        // Input with an uppercase scheme segment; the canonical form must be lowercase
+        String inputUrl = "jdbc:MySQL://localhost:3306/";
+        // The returned URL must be canonical (lowercase sub-scheme) and not the raw input
+        String result = Install.validateJdbcUrl(inputUrl);
+        assertNotNull("validateJdbcUrl() must return a non-null result", result);
+        assertTrue(
+            "Returned URL must use the lowercase canonical sub-scheme (reconstructed from parsed components)",
+            result.startsWith("jdbc:mysql://"));
     }
 
     /**
@@ -511,6 +552,74 @@ public class InstallTest {
             "Install.java must not assign dburl directly from request.getParameter() — "
             + "it must go through validateJdbcUrl() first",
             !hasDirectAssignment);
+    }
+
+    /**
+     * Verify that a validated URL from validateJdbcUrl() does NOT contain any
+     * injected query parameters or semicolons, even when the input contained them.
+     * This confirms the reconstruction eliminates all injection vectors before the
+     * value reaches DriverManager.getConnection() at the sink (line 276).
+     *
+     * Attack scenario covered: attacker supplies
+     *   "jdbc:mysql://localhost:3306/?allowLoadLocalInfile=true"
+     * If the raw value were returned, the sink "dburl + dbname" would produce a URL
+     * with injected properties.  The reconstructed URL contains only scheme://host:port/
+     * and is safe to concatenate with the validated dbname identifier.
+     */
+    @Test
+    public void validateJdbcUrl_reconstructedUrlContainsNoInjectedProperties() {
+        // First confirm the input with query params is rejected at the boundary
+        String queryInjection = "jdbc:mysql://localhost:3306/?autoReconnect=true";
+        try {
+            Install.validateJdbcUrl(queryInjection);
+            fail("validateJdbcUrl() must reject a URL with query parameters");
+        } catch (IllegalArgumentException e) {
+            // Expected — injection rejected at input boundary
+            assertNotNull(e.getMessage());
+        }
+
+        // For a clean valid URL, verify the returned canonical URL has no '?', '#', or ';'
+        String cleanUrl = "jdbc:mysql://localhost:3306/";
+        String result = Install.validateJdbcUrl(cleanUrl);
+        assertNotNull(result);
+        assertTrue("Canonical URL must not contain '?' (query param injection vector)",
+            !result.contains("?"));
+        assertTrue("Canonical URL must not contain '#' (fragment injection vector)",
+            !result.contains("#"));
+        assertTrue("Canonical URL must not contain ';' (property injection vector)",
+            !result.contains(";"));
+    }
+
+    /**
+     * Verify that validateJdbcUrl() accepts a MySQL URL without an explicit port,
+     * and returns a canonical base URL that ends with '/'.
+     */
+    @Test
+    public void validateJdbcUrl_acceptsMysqlUrlWithoutPort() {
+        String validUrl = "jdbc:mysql://db.internal/";
+        String result = Install.validateJdbcUrl(validUrl);
+        assertNotNull("validateJdbcUrl() must accept a MySQL URL without explicit port", result);
+        assertTrue("Returned URL must start with jdbc:mysql://", result.startsWith("jdbc:mysql://"));
+        assertTrue("Returned URL must end with '/'", result.endsWith("/"));
+    }
+
+    /**
+     * Structural test: confirm the source uses URI-component reconstruction in
+     * validateJdbcUrl() (parsedUri.getHost(), parsedUri.getPort()) rather than
+     * simply returning the raw input string.  This is the key SAST-engine-recognized
+     * pattern that breaks the taint flow.
+     */
+    @Test
+    public void validateJdbcUrl_sourceUsesUriComponentReconstruction() throws Exception {
+        String source = readInstallSource();
+        // Must call parsedUri.getHost() to extract the host from the parsed URI
+        assertTrue(
+            "validateJdbcUrl() must call parsedUri.getHost() to reconstruct URL from parsed components",
+            source.contains("parsedUri.getHost()"));
+        // Must call parsedUri.getPort() to extract the port
+        assertTrue(
+            "validateJdbcUrl() must call parsedUri.getPort() to reconstruct URL from parsed components",
+            source.contains("parsedUri.getPort()"));
     }
 
     // -----------------------------------------------------------------------
