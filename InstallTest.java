@@ -16,21 +16,27 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.fail;
 import static org.mockito.Matchers.anyInt;
 import static org.mockito.Matchers.anyString;
 import static org.mockito.Matchers.contains;
 import static org.mockito.Mockito.*;
 
 /**
- * Tests for Install servlet to verify SQL injection remediation (CWE-89).
+ * Tests for Install servlet covering two remediations:
  *
- * The vulnerability was: user-supplied "adminuser" and "adminpass" parameters
- * concatenated directly into a SQL INSERT string executed via
- * Statement.executeUpdate() at line 135 of Install.java.
+ * 1. SQL Injection (CWE-89): user-supplied "adminuser" and "adminpass" parameters
+ *    are bound via PreparedStatement parameterized placeholders ("?") rather than
+ *    concatenated directly into a SQL INSERT string.
  *
- * The fix replaces that concatenated INSERT with a PreparedStatement using
- * parameterized placeholders ("?") so the JDBC driver handles all quoting —
- * user data is never interpreted as SQL syntax.
+ * 2. Connection String Injection (CWE-99): user-supplied "dburl" parameter is
+ *    validated via java.net.URI parsing + scheme allowlist in validateJdbcUrl()
+ *    before being stored in Install.dburl and passed to DriverManager.getConnection().
+ *    The fix rejects URLs that carry injected query parameters (?...), fragments (#...),
+ *    semicolons (;...), or disallowed JDBC sub-schemes.
  */
 @RunWith(MockitoJUnitRunner.class)
 public class InstallTest {
@@ -272,6 +278,239 @@ public class InstallTest {
 
         // setString(2, ...) must be called with exactly the payload string (position 2 = adminpass)
         verify(preparedStatement).setString(2, exactPayload);
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection String Injection (CWE-99) — structural tests
+    //
+    // These tests verify that Install.java uses java.net.URI + allowlist to
+    // validate the user-supplied "dburl" parameter before it reaches
+    // DriverManager.getConnection(), breaking the taint flow reported by the
+    // SAST finding at line 162.
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verify that Install.java imports java.net.URI (required by the fix).
+     */
+    @Test
+    public void installImportsJavaNetUri() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must import java.net.URI to support JDBC URL validation",
+            source.contains("import java.net.URI"));
+    }
+
+    /**
+     * Verify that Install.java defines a validateJdbcUrl() method.
+     * This method is the boundary sanitizer that breaks the CWE-99 taint flow.
+     */
+    @Test
+    public void installDefinesValidateJdbcUrlMethod() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must define a validateJdbcUrl() method to validate user-supplied dburl",
+            source.contains("validateJdbcUrl("));
+    }
+
+    /**
+     * Verify that validateJdbcUrl() is called before assigning to dburl at the
+     * input boundary (in processRequest / before dburl is stored).
+     */
+    @Test
+    public void dburlAssignmentUsesValidateJdbcUrl() throws Exception {
+        String source = readInstallSource();
+        // The assignment "dburl = validateJdbcUrl(...)" must appear
+        assertTrue(
+            "Install.java must assign dburl from validateJdbcUrl() to validate input at the boundary",
+            source.contains("dburl = validateJdbcUrl("));
+    }
+
+    /**
+     * Verify that ALLOWED_JDBC_SCHEMES allowlist is defined in Install.java.
+     * This ensures only known-safe JDBC sub-schemes are accepted.
+     */
+    @Test
+    public void installDefinesAllowedJdbcSchemesSet() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must define ALLOWED_JDBC_SCHEMES allowlist",
+            source.contains("ALLOWED_JDBC_SCHEMES"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection String Injection (CWE-99) — unit tests for validateJdbcUrl()
+    //
+    // These tests call Install.validateJdbcUrl() directly to confirm that all
+    // injection vectors are rejected at the input boundary.
+    // -----------------------------------------------------------------------
+
+    /**
+     * A well-formed MySQL JDBC URL with no injected properties must be accepted.
+     */
+    @Test
+    public void validateJdbcUrl_acceptsValidMysqlUrl() {
+        String validUrl = "jdbc:mysql://localhost:3306/";
+        String result = Install.validateJdbcUrl(validUrl);
+        assertEquals(
+            "validateJdbcUrl() must return the original URL unchanged when it is valid",
+            validUrl, result);
+    }
+
+    /**
+     * A well-formed PostgreSQL JDBC URL must be accepted.
+     */
+    @Test
+    public void validateJdbcUrl_acceptsValidPostgresqlUrl() {
+        String validUrl = "jdbc:postgresql://db.example.com:5432/";
+        String result = Install.validateJdbcUrl(validUrl);
+        assertEquals(
+            "validateJdbcUrl() must accept a well-formed PostgreSQL JDBC URL",
+            validUrl, result);
+    }
+
+    /**
+     * A null URL must be rejected with IllegalArgumentException.
+     */
+    @Test
+    public void validateJdbcUrl_rejectsNull() {
+        try {
+            Install.validateJdbcUrl(null);
+            fail("validateJdbcUrl(null) must throw IllegalArgumentException");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A URL that does not start with "jdbc:" must be rejected.
+     * Attack scenario: attacker supplies "http://evil.com/exfil?" to redirect
+     * the connection to an attacker-controlled host.
+     */
+    @Test
+    public void validateJdbcUrl_rejectsNonJdbcScheme() {
+        try {
+            Install.validateJdbcUrl("http://evil.example.com/exfil");
+            fail("validateJdbcUrl() must reject a URL that does not start with 'jdbc:'");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A JDBC URL with injected query parameters must be rejected.
+     * Attack scenario: "jdbc:mysql://localhost:3306/?allowLoadLocalInfile=true"
+     * — this enables reading arbitrary local files via the MySQL JDBC driver.
+     */
+    @Test
+    public void validateJdbcUrl_rejectsQueryParameterInjection() {
+        String injectedUrl = "jdbc:mysql://localhost:3306/?allowLoadLocalInfile=true";
+        try {
+            Install.validateJdbcUrl(injectedUrl);
+            fail("validateJdbcUrl() must reject a JDBC URL with injected query parameters");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A JDBC URL with a semicolon-delimited injected property must be rejected.
+     * Attack scenario (SQL Server style): "jdbc:sqlserver://host;integratedSecurity=true"
+     * — this overrides authentication settings.
+     */
+    @Test
+    public void validateJdbcUrl_rejectsSemicolonPropertyInjection() {
+        String injectedUrl = "jdbc:sqlserver://localhost;integratedSecurity=true";
+        try {
+            Install.validateJdbcUrl(injectedUrl);
+            fail("validateJdbcUrl() must reject a JDBC URL with semicolon-injected properties");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A JDBC URL with a fragment (#) component must be rejected.
+     * Fragments can be used to smuggle data past naive prefix checks.
+     */
+    @Test
+    public void validateJdbcUrl_rejectsFragmentComponent() {
+        // Note: java.net.URI parses '#' as a fragment delimiter
+        String injectedUrl = "jdbc:mysql://localhost:3306/#injected";
+        try {
+            Install.validateJdbcUrl(injectedUrl);
+            fail("validateJdbcUrl() must reject a JDBC URL containing a fragment component");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A JDBC URL with a disallowed sub-scheme (e.g. "jdbc:derby:") must be rejected.
+     * Attack scenario: an attacker specifies a driver not present in the allowlist to
+     * load arbitrary code via Class.forName() or trigger unexpected behavior.
+     */
+    @Test
+    public void validateJdbcUrl_rejectsDisallowedSubScheme() {
+        String disallowedUrl = "jdbc:derby://localhost:1527/testdb";
+        try {
+            Install.validateJdbcUrl(disallowedUrl);
+            fail("validateJdbcUrl() must reject a JDBC URL with a sub-scheme not in the allowlist");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A JDBC URL with injected query parameters appended to a valid base URL must
+     * still be rejected — confirming the fix covers the exact sink pattern at line 162
+     * where dburl is concatenated with dbname: "jdbc:mysql://localhost:3306/?..." + "mydb"
+     * would result in an injected URL being passed to DriverManager.getConnection().
+     */
+    @Test
+    public void validateJdbcUrl_rejectsInjectionTailoredForSinkConcatenation() {
+        // The attacker sets dburl = "jdbc:mysql://localhost:3306/?allowLoadLocalInfile=true&db="
+        // so that dburl+dbname = "jdbc:mysql://localhost:3306/?allowLoadLocalInfile=true&db=mydb"
+        String injectedUrl = "jdbc:mysql://localhost:3306/?allowLoadLocalInfile=true&db=";
+        try {
+            Install.validateJdbcUrl(injectedUrl);
+            fail("validateJdbcUrl() must reject injection payload tailored for the dburl+dbname sink");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * A completely empty string must be rejected (missing jdbc: prefix).
+     */
+    @Test
+    public void validateJdbcUrl_rejectsEmptyString() {
+        try {
+            Install.validateJdbcUrl("");
+            fail("validateJdbcUrl(\"\") must throw IllegalArgumentException");
+        } catch (IllegalArgumentException e) {
+            assertNotNull("Exception message must not be null", e.getMessage());
+        }
+    }
+
+    /**
+     * Verify that the source confirms dburl is NOT concatenated into the connection
+     * string without going through validateJdbcUrl().
+     * The vulnerable pattern was: DriverManager.getConnection(dburl+dbname,...)
+     * where dburl was assigned directly from request.getParameter("dburl").
+     * After the fix, dburl must only be set via validateJdbcUrl().
+     */
+    @Test
+    public void dburlIsNotAssignedDirectlyFromRequestParameter() throws Exception {
+        String source = readInstallSource();
+        // The old vulnerable pattern: dburl = request.getParameter(...)
+        // must no longer appear; it must go through validateJdbcUrl()
+        boolean hasDirectAssignment =
+            source.contains("dburl = request.getParameter(") ||
+            source.contains("dburl=request.getParameter(");
+        assertTrue(
+            "Install.java must not assign dburl directly from request.getParameter() — "
+            + "it must go through validateJdbcUrl() first",
+            !hasDirectAssignment);
     }
 
     // -----------------------------------------------------------------------
