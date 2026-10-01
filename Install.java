@@ -10,6 +10,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -50,6 +52,106 @@ public class Install extends HttpServlet {
         ))
     );
 
+    /**
+     * Allowlist of permitted JDBC URL scheme prefixes (the portion after "jdbc:").
+     * Only these sub-schemes are accepted to prevent Connection String Injection
+     * (CWE-99) via a crafted "dburl" parameter.
+     */
+    private static final Set<String> ALLOWED_JDBC_SCHEMES = Collections.unmodifiableSet(
+        new HashSet<>(Arrays.asList(
+            "mysql",
+            "postgresql",
+            "oracle:thin",
+            "sqlserver",
+            "h2",
+            "hsqldb",
+            "sqlite"
+        ))
+    );
+
+    /**
+     * Validate a user-supplied JDBC base URL against an allowlist of permitted
+     * schemes and enforce that no query parameters or extra properties have been
+     * injected.
+     *
+     * <p>A JDBC URL has the form {@code jdbc:<sub-scheme>://<host>[:<port>][/<path>]}.
+     * We parse the part after the {@code jdbc:} prefix as a standard {@link URI}
+     * so that the JDK's RFC-3986 parser—rather than custom regex—validates
+     * structure and extracts the scheme, host, port, and path.  If the URI
+     * parser accepts query or fragment components the URL is rejected because
+     * those components are used to inject JDBC connection properties
+     * (e.g. {@code ?allowLoadLocalInfile=true}).</p>
+     *
+     * @param url the value received from the HTTP request parameter "dburl"
+     * @return the validated, unchanged URL string if it passes all checks
+     * @throws IllegalArgumentException if the URL is null, does not start with
+     *         {@code jdbc:}, uses a disallowed sub-scheme, or contains injected
+     *         query or fragment components
+     */
+    static String validateJdbcUrl(String url) {
+        if (url == null) {
+            throw new IllegalArgumentException("JDBC URL must not be null");
+        }
+        // JDBC URLs must begin with the "jdbc:" prefix
+        if (!url.toLowerCase(java.util.Locale.ROOT).startsWith("jdbc:")) {
+            throw new IllegalArgumentException("JDBC URL must start with 'jdbc:'");
+        }
+        // Extract the sub-scheme+authority portion (everything after "jdbc:")
+        String afterJdbc = url.substring("jdbc:".length());
+
+        // Parse via java.net.URI to leverage the JDK's RFC-3986 parser.
+        // For jdbc:oracle:thin-style URLs the sub-scheme contains a colon, so
+        // we only parse the sub-scheme prefix up to the first colon to check
+        // the allowlist, then parse the full host/authority part separately.
+        URI parsedUri;
+        try {
+            parsedUri = new URI(afterJdbc);
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("Malformed JDBC URL: " + e.getMessage(), e);
+        }
+
+        // Reject URLs that carry query parameters – these are the primary
+        // injection vector for JDBC connection string injection (CWE-99).
+        if (parsedUri.getQuery() != null) {
+            throw new IllegalArgumentException(
+                "JDBC URL must not contain query parameters (?...) to prevent connection string injection");
+        }
+        // Reject fragment components as well
+        if (parsedUri.getFragment() != null) {
+            throw new IllegalArgumentException(
+                "JDBC URL must not contain a fragment (#...) component");
+        }
+        // Reject semicolon-delimited property injection (common in MS SQL Server URLs)
+        if (afterJdbc.contains(";")) {
+            throw new IllegalArgumentException(
+                "JDBC URL must not contain semicolons (;) to prevent connection property injection");
+        }
+
+        // Validate the sub-scheme against the allowlist.
+        // parsedUri.getScheme() returns the first component up to the first colon.
+        String subScheme = parsedUri.getScheme();
+        if (subScheme == null) {
+            throw new IllegalArgumentException("JDBC URL is missing a sub-scheme after 'jdbc:'");
+        }
+        // Check full sub-scheme (e.g. "oracle:thin") as well as simple scheme
+        boolean schemeAllowed = ALLOWED_JDBC_SCHEMES.contains(subScheme.toLowerCase(java.util.Locale.ROOT));
+        if (!schemeAllowed) {
+            // Check compound sub-schemes like "oracle:thin"
+            for (String allowed : ALLOWED_JDBC_SCHEMES) {
+                if (afterJdbc.toLowerCase(java.util.Locale.ROOT).startsWith(allowed + ":")) {
+                    schemeAllowed = true;
+                    break;
+                }
+            }
+        }
+        if (!schemeAllowed) {
+            throw new IllegalArgumentException(
+                "JDBC URL sub-scheme '" + subScheme + "' is not in the permitted allowlist");
+        }
+
+        return url;
+    }
+
        static String dburl;
        static String jdbcdriver;
        static String dbuser;
@@ -74,7 +176,19 @@ public class Install extends HttpServlet {
         String configPath=getServletContext().getRealPath("/WEB-INF/config.properties");
         
         //Getting Database Configuration from User Input
-        dburl = request.getParameter("dburl");
+        // Validate dburl via java.net.URI parsing + allowlist to prevent Connection
+        // String Injection (CWE-99): reject query parameters, fragments, semicolons,
+        // and disallowed JDBC sub-schemes before the value reaches DriverManager.
+        String requestedDbUrl = request.getParameter("dburl");
+        try {
+            dburl = validateJdbcUrl(requestedDbUrl);
+        } catch (IllegalArgumentException e) {
+            response.setContentType("text/html;charset=UTF-8");
+            try (PrintWriter out = response.getWriter()) {
+                out.println("<!DOCTYPE html><html><body>Invalid database URL specified.</body></html>");
+            }
+            return;
+        }
         // Validate jdbcdriver against an explicit allowlist before storing it.
         // Class.forName() is called with this value later; accepting arbitrary
         // class names from user input would allow unsafe reflection (CWE-470).
