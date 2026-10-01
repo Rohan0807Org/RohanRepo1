@@ -12,8 +12,9 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.sql.Statement; 
+import java.sql.Statement;
 import java.util.Properties;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
@@ -102,21 +103,28 @@ public class Install extends HttpServlet {
     }
      protected boolean setup(String i) throws IOException
     {
-        
-       if(i.equals("1"))   
+
+       if(i.equals("1"))
        {
- 
+
                     try
                    {
+                    // Validate dbname as a safe SQL identifier (alphanumeric + underscore only,
+                    // must start with a letter) to prevent SQL injection in DDL statements.
+                    // PreparedStatement cannot parameterize database/schema identifiers in JDBC,
+                    // so allowlist-based identifier validation is required before use in DDL.
+                    if (dbname == null || !dbname.matches("[A-Za-z][A-Za-z0-9_]*")) {
+                        return false;
+                    }
                     Class.forName(jdbcdriver);
                     Connection con= DriverManager.getConnection(dburl,dbuser,dbpass);
                       if(con!=null && !con.isClosed())
                         {
                             //Database creation
-                             Statement stmt = con.createStatement();  
-                             stmt.executeUpdate("DROP DATABASE IF EXISTS "+dbname);
-                             
-                             stmt.executeUpdate("CREATE DATABASE "+dbname);
+                             Statement stmt = con.createStatement();
+                             stmt.executeUpdate("DROP DATABASE IF EXISTS `" + dbname + "`");
+
+                             stmt.executeUpdate("CREATE DATABASE `" + dbname + "`");
                              con.close();
                             con= DriverManager.getConnection(dburl+dbname,dbuser,dbpass);
                              stmt = con.createStatement();
