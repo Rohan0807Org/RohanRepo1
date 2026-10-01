@@ -71,8 +71,8 @@ public class Install extends HttpServlet {
 
     /**
      * Validate a user-supplied JDBC base URL against an allowlist of permitted
-     * schemes and enforce that no query parameters or extra properties have been
-     * injected.
+     * schemes, enforce that no query parameters or extra properties have been
+     * injected, and reconstruct a canonical URL from the parsed URI components.
      *
      * <p>A JDBC URL has the form {@code jdbc:<sub-scheme>://<host>[:<port>][/<path>]}.
      * We parse the part after the {@code jdbc:} prefix as a standard {@link URI}
@@ -80,13 +80,21 @@ public class Install extends HttpServlet {
      * structure and extracts the scheme, host, port, and path.  If the URI
      * parser accepts query or fragment components the URL is rejected because
      * those components are used to inject JDBC connection properties
-     * (e.g. {@code ?allowLoadLocalInfile=true}).</p>
+     * (e.g. {@code ?allowLoadLocalInfile=true}).
+     *
+     * <p>Crucially, instead of returning the raw user-supplied string, this method
+     * <em>reconstructs</em> the connection base-URL from the individually parsed and
+     * validated URI components (scheme, host, port).  This breaks the taint flow
+     * (CWE-99) because the value that eventually reaches
+     * {@link java.sql.DriverManager#getConnection} is derived entirely from
+     * the parsed, allowlist-checked fields, not from the raw request parameter.</p>
      *
      * @param url the value received from the HTTP request parameter "dburl"
-     * @return the validated, unchanged URL string if it passes all checks
+     * @return a canonical, reconstructed JDBC base URL (e.g. {@code jdbc:mysql://host:port/})
+     *         derived from the parsed URI components, not from the raw input string
      * @throws IllegalArgumentException if the URL is null, does not start with
      *         {@code jdbc:}, uses a disallowed sub-scheme, or contains injected
-     *         query or fragment components
+     *         query, fragment, or semicolon components
      */
     static String validateJdbcUrl(String url) {
         if (url == null) {
@@ -98,6 +106,13 @@ public class Install extends HttpServlet {
         }
         // Extract the sub-scheme+authority portion (everything after "jdbc:")
         String afterJdbc = url.substring("jdbc:".length());
+
+        // Reject semicolon-delimited property injection before URI parsing
+        // (common in MS SQL Server URLs, e.g. "jdbc:sqlserver://host;prop=val").
+        if (afterJdbc.contains(";")) {
+            throw new IllegalArgumentException(
+                "JDBC URL must not contain semicolons (;) to prevent connection property injection");
+        }
 
         // Parse via java.net.URI to leverage the JDK's RFC-3986 parser.
         // For jdbc:oracle:thin-style URLs the sub-scheme contains a colon, so
@@ -121,11 +136,6 @@ public class Install extends HttpServlet {
             throw new IllegalArgumentException(
                 "JDBC URL must not contain a fragment (#...) component");
         }
-        // Reject semicolon-delimited property injection (common in MS SQL Server URLs)
-        if (afterJdbc.contains(";")) {
-            throw new IllegalArgumentException(
-                "JDBC URL must not contain semicolons (;) to prevent connection property injection");
-        }
 
         // Validate the sub-scheme against the allowlist.
         // parsedUri.getScheme() returns the first component up to the first colon.
@@ -133,10 +143,9 @@ public class Install extends HttpServlet {
         if (subScheme == null) {
             throw new IllegalArgumentException("JDBC URL is missing a sub-scheme after 'jdbc:'");
         }
-        // Check full sub-scheme (e.g. "oracle:thin") as well as simple scheme
+        // Check simple sub-scheme; also check compound sub-schemes like "oracle:thin"
         boolean schemeAllowed = ALLOWED_JDBC_SCHEMES.contains(subScheme.toLowerCase(java.util.Locale.ROOT));
         if (!schemeAllowed) {
-            // Check compound sub-schemes like "oracle:thin"
             for (String allowed : ALLOWED_JDBC_SCHEMES) {
                 if (afterJdbc.toLowerCase(java.util.Locale.ROOT).startsWith(allowed + ":")) {
                     schemeAllowed = true;
@@ -149,7 +158,22 @@ public class Install extends HttpServlet {
                 "JDBC URL sub-scheme '" + subScheme + "' is not in the permitted allowlist");
         }
 
-        return url;
+        // Reconstruct the base URL from parsed URI components rather than returning
+        // the raw user-supplied string.  This breaks the taint flow: the value that
+        // reaches DriverManager.getConnection() is built from individually validated
+        // fields (allowlisted sub-scheme, RFC-3986-parsed host, numeric port), not
+        // from the attacker-controlled input string.
+        String host = parsedUri.getHost();
+        if (host == null || host.isEmpty()) {
+            throw new IllegalArgumentException("JDBC URL must specify a host");
+        }
+        int port = parsedUri.getPort(); // -1 if absent; DriverManager accepts that
+        String canonicalSubScheme = subScheme.toLowerCase(java.util.Locale.ROOT);
+        if (port > 0) {
+            return "jdbc:" + canonicalSubScheme + "://" + host + ":" + port + "/";
+        } else {
+            return "jdbc:" + canonicalSubScheme + "://" + host + "/";
+        }
     }
 
        static String dburl;
