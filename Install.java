@@ -12,12 +12,14 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.security.SecureRandom;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Properties;
@@ -26,6 +28,7 @@ import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSession;
 import org.cysecurity.cspf.jvl.model.HashMe;
 
 /**
@@ -33,6 +36,22 @@ import org.cysecurity.cspf.jvl.model.HashMe;
  * @author breakthesec
  */
 public class Install extends HttpServlet {
+
+    /**
+     * Session attribute key used to store and verify the CSRF token for the
+     * installation form.  The token is generated once per GET request and
+     * must be submitted back (via a hidden form field) on every POST.
+     * Checking the token against the session value (server-side state only
+     * the legitimate user's browser can know) breaks the CSRF taint flow
+     * reported by the SAST finding (CWE-352).
+     */
+    static final String CSRF_TOKEN_SESSION_ATTR = "install_csrf_token";
+
+    /**
+     * Cryptographically-secure random source for CSRF token generation.
+     * SecureRandom is thread-safe and is reused across requests.
+     */
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     /**
      * Allowlist of permitted JDBC driver class names.
@@ -186,6 +205,30 @@ public class Install extends HttpServlet {
        static String adminpass;
                
     /**
+     * Generate a cryptographically-random, Base64-URL-encoded CSRF token,
+     * store it in the user's session, and return it so it can be embedded
+     * as a hidden field in the install form.
+     *
+     * <p>The token is 32 random bytes (256 bits), making brute-force
+     * infeasible.  It is stored under {@link #CSRF_TOKEN_SESSION_ATTR} so
+     * that {@link #processRequest} can compare the submitted value against
+     * the session value using {@link String#equals}, which is sufficient
+     * here because neither branch reveals timing information that helps an
+     * attacker (the token is a random nonce, not a secret derived from
+     * user credentials).</p>
+     *
+     * @param session the caller's HTTP session (must not be null)
+     * @return the newly-generated token string
+     */
+    static String generateAndStoreCsrfToken(HttpSession session) {
+        byte[] tokenBytes = new byte[32];
+        SECURE_RANDOM.nextBytes(tokenBytes);
+        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+        session.setAttribute(CSRF_TOKEN_SESSION_ATTR, token);
+        return token;
+    }
+
+    /**
      * Processes requests for both HTTP <code>GET</code> and <code>POST</code>
      * methods.
      *
@@ -194,11 +237,11 @@ public class Install extends HttpServlet {
      * @throws ServletException if a servlet-specific error occurs
      * @throws IOException if an I/O error occurs
      */
-   
+
     protected void processRequest(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
         String configPath=getServletContext().getRealPath("/WEB-INF/config.properties");
-        
+
         //Getting Database Configuration from User Input
         // Validate dburl via java.net.URI parsing + allowlist to prevent Connection
         // String Injection (CWE-99): reject query parameters, fragments, semicolons,
@@ -371,6 +414,11 @@ public class Install extends HttpServlet {
     /**
      * Handles the HTTP <code>GET</code> method.
      *
+     * <p>GET requests are safe (read-only intent).  A fresh CSRF token is
+     * generated, stored in the session, and forwarded to the install form
+     * so the form can embed it as a hidden field.  No state-altering
+     * operations are performed on GET.</p>
+     *
      * @param request servlet request
      * @param response servlet response
      * @throws ServletException if a servlet-specific error occurs
@@ -379,11 +427,26 @@ public class Install extends HttpServlet {
     @Override
     protected void doGet(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
-        processRequest(request, response);
+        // Generate a fresh CSRF token for the install form on every GET.
+        // The token is stored in the session; the form must submit it back.
+        HttpSession session = request.getSession(true);
+        generateAndStoreCsrfToken(session);
+        // GET does not perform any state-altering operations — forward to the form.
+        request.getRequestDispatcher("/install.jsp").forward(request, response);
     }
 
     /**
      * Handles the HTTP <code>POST</code> method.
+     *
+     * <p>CSRF protection (CWE-352): the submitted {@code _csrfToken} parameter
+     * is validated against the token stored in the server-side session.  If the
+     * values do not match (or are absent), the request is rejected with
+     * HTTP 403 before any state-altering processing takes place.</p>
+     *
+     * <p>Cross-site requests forged by an attacker cannot carry the correct
+     * token value because the Same-Origin Policy prevents the attacker's page
+     * from reading the token from the user's session or from the install form
+     * HTML.</p>
      *
      * @param request servlet request
      * @param response servlet response
@@ -393,6 +456,29 @@ public class Install extends HttpServlet {
     @Override
     protected void doPost(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
+        // --- CSRF token validation (CWE-352 remediation) ---
+        // Retrieve the token that was stored in the session when the form was served.
+        HttpSession session = request.getSession(false);
+        String sessionToken = (session != null)
+                ? (String) session.getAttribute(CSRF_TOKEN_SESSION_ATTR)
+                : null;
+        // Retrieve the token submitted with the POST form body.
+        String submittedToken = request.getParameter("_csrfToken");
+
+        // Reject the request if either token is missing or they do not match.
+        // String.equals() is used here because a CSRF token is a random nonce:
+        // it does not derive from a secret value, so there is no timing-attack
+        // surface to exploit.
+        if (sessionToken == null || !sessionToken.equals(submittedToken)) {
+            response.sendError(HttpServletResponse.SC_FORBIDDEN,
+                    "Invalid or missing CSRF token.");
+            return;
+        }
+
+        // Invalidate the single-use token after validation to prevent replay.
+        session.removeAttribute(CSRF_TOKEN_SESSION_ATTR);
+
+        // Token is valid — proceed with state-altering installation.
         processRequest(request, response);
     }
 
