@@ -15,7 +15,11 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Properties;
+import java.util.Set;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
@@ -27,6 +31,24 @@ import org.cysecurity.cspf.jvl.model.HashMe;
  * @author breakthesec
  */
 public class Install extends HttpServlet {
+
+    /**
+     * Allowlist of permitted JDBC driver class names.
+     * Only these values may be passed to Class.forName() to prevent
+     * unsafe reflection (CWE-470) via user-controlled input.
+     */
+    private static final Set<String> ALLOWED_JDBC_DRIVERS = Collections.unmodifiableSet(
+        new HashSet<>(Arrays.asList(
+            "com.mysql.jdbc.Driver",
+            "com.mysql.cj.jdbc.Driver",
+            "org.postgresql.Driver",
+            "oracle.jdbc.OracleDriver",
+            "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+            "org.h2.Driver",
+            "org.hsqldb.jdbcDriver",
+            "org.sqlite.JDBC"
+        ))
+    );
 
        static String dburl;
        static String jdbcdriver;
@@ -53,7 +75,18 @@ public class Install extends HttpServlet {
         
         //Getting Database Configuration from User Input
         dburl = request.getParameter("dburl");
-        jdbcdriver = request.getParameter("jdbcdriver");
+        // Validate jdbcdriver against an explicit allowlist before storing it.
+        // Class.forName() is called with this value later; accepting arbitrary
+        // class names from user input would allow unsafe reflection (CWE-470).
+        String requestedDriver = request.getParameter("jdbcdriver");
+        if (requestedDriver == null || !ALLOWED_JDBC_DRIVERS.contains(requestedDriver)) {
+            response.setContentType("text/html;charset=UTF-8");
+            try (PrintWriter out = response.getWriter()) {
+                out.println("<!DOCTYPE html><html><body>Invalid JDBC driver specified.</body></html>");
+            }
+            return;
+        }
+        jdbcdriver = requestedDriver;
         dbuser = request.getParameter("dbuser");
         dbpass = request.getParameter("dbpass");
         dbname = request.getParameter("dbname");
