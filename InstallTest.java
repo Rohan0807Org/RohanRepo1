@@ -9,6 +9,7 @@ import org.mockito.runners.MockitoJUnitRunner;
 import javax.servlet.ServletContext;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSession;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -18,7 +19,9 @@ import java.sql.Statement;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.fail;
 import static org.mockito.Matchers.anyInt;
 import static org.mockito.Matchers.anyString;
@@ -43,6 +46,7 @@ public class InstallTest {
 
     @Mock private HttpServletRequest request;
     @Mock private HttpServletResponse response;
+    @Mock private HttpSession session;
     @Mock private Connection connection;
     @Mock private PreparedStatement preparedStatement;
     @Mock private Statement statement;
@@ -620,6 +624,231 @@ public class InstallTest {
         assertTrue(
             "validateJdbcUrl() must call parsedUri.getPort() to reconstruct URL from parsed components",
             source.contains("parsedUri.getPort()"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CSRF protection (CWE-352) — structural tests
+    //
+    // These tests verify that Install.java defines and uses the session-based
+    // CSRF token mechanism introduced by the fix.  The taint flow reported by
+    // the SAST finding (dbname from request.getParameter at line 230 reaching
+    // stmt.executeUpdate at line 314) is only reachable via doPost(), which
+    // now validates a server-side session token before calling processRequest().
+    // -----------------------------------------------------------------------
+
+    /**
+     * Verify that Install.java imports javax.servlet.http.HttpSession,
+     * which is required by the CSRF token validation added in doPost().
+     */
+    @Test
+    public void installImportsHttpSession() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must import javax.servlet.http.HttpSession for CSRF token session storage",
+            source.contains("import javax.servlet.http.HttpSession"));
+    }
+
+    /**
+     * Verify that Install.java imports java.security.SecureRandom.
+     * SecureRandom is used to generate the CSRF token, ensuring unpredictability.
+     */
+    @Test
+    public void installImportsSecureRandom() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must import java.security.SecureRandom for cryptographically-random CSRF token generation",
+            source.contains("import java.security.SecureRandom"));
+    }
+
+    /**
+     * Verify that Install.java imports java.util.Base64.
+     * Base64 URL encoding is used to convert the raw token bytes to a string.
+     */
+    @Test
+    public void installImportsBase64() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must import java.util.Base64 for CSRF token encoding",
+            source.contains("import java.util.Base64"));
+    }
+
+    /**
+     * Verify that the CSRF_TOKEN_SESSION_ATTR constant is defined in Install.java.
+     * This named constant is the session key under which the token is stored and
+     * looked up — its presence confirms the session-based CSRF pattern is in use.
+     */
+    @Test
+    public void installDefinesCsrfTokenSessionAttr() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must define CSRF_TOKEN_SESSION_ATTR constant",
+            source.contains("CSRF_TOKEN_SESSION_ATTR"));
+    }
+
+    /**
+     * Verify that generateAndStoreCsrfToken() is defined in Install.java.
+     * This method encapsulates token generation and stores the token in the session.
+     */
+    @Test
+    public void installDefinesGenerateAndStoreCsrfToken() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "Install.java must define generateAndStoreCsrfToken() to generate and persist CSRF tokens",
+            source.contains("generateAndStoreCsrfToken("));
+    }
+
+    /**
+     * Verify that doPost() calls session.getAttribute() to retrieve the stored
+     * CSRF token for comparison.  This is the server-side state check that breaks
+     * the CSRF taint flow: a forged cross-site request cannot supply the correct
+     * token because the attacker cannot read the victim's session.
+     */
+    @Test
+    public void doPostRetrievesTokenFromSession() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "doPost() must call session.getAttribute() to retrieve the stored CSRF token",
+            source.contains("session.getAttribute(CSRF_TOKEN_SESSION_ATTR)") ||
+            source.contains("getAttribute(CSRF_TOKEN_SESSION_ATTR)"));
+    }
+
+    /**
+     * Verify that doPost() calls response.sendError(SC_FORBIDDEN, ...) when the
+     * CSRF token is invalid, rejecting the forged request before processRequest().
+     */
+    @Test
+    public void doPostSendsForbiddenOnCsrfMismatch() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "doPost() must call response.sendError(SC_FORBIDDEN, ...) to reject invalid CSRF tokens",
+            source.contains("sendError(HttpServletResponse.SC_FORBIDDEN") ||
+            source.contains("sendError(403"));
+    }
+
+    /**
+     * Verify that doPost() removes the CSRF token from the session after
+     * successful validation to prevent replay attacks.
+     */
+    @Test
+    public void doPostRemovesCsrfTokenAfterValidation() throws Exception {
+        String source = readInstallSource();
+        assertTrue(
+            "doPost() must call session.removeAttribute(CSRF_TOKEN_SESSION_ATTR) after validating the token to prevent replay",
+            source.contains("removeAttribute(CSRF_TOKEN_SESSION_ATTR)") ||
+            source.contains("removeAttribute(Install.CSRF_TOKEN_SESSION_ATTR)"));
+    }
+
+    /**
+     * Verify that processRequest() is only called from doPost() after the CSRF
+     * check, and that doGet() no longer delegates to processRequest().
+     * This structural test confirms that GET requests (which are subject to CSRF
+     * via link injection) cannot trigger state-altering operations.
+     */
+    @Test
+    public void doGetDoesNotCallProcessRequest() throws Exception {
+        String source = readInstallSource();
+        // Split into per-method sections and check that "doGet" block does not
+        // contain a processRequest() call.
+        int doGetIdx = source.indexOf("protected void doGet(");
+        int doPostIdx = source.indexOf("protected void doPost(");
+        if (doGetIdx < 0 || doPostIdx < 0) {
+            // If the methods were renamed the structural check is skipped
+            org.junit.Assume.assumeTrue("doGet/doPost not found in Install.java", false);
+            return;
+        }
+        // The text between doGet and doPost is the body of doGet.
+        String doGetBody = source.substring(doGetIdx, doPostIdx);
+        assertFalse(
+            "doGet() must NOT call processRequest() — state-altering operations must only be reachable via doPost() after CSRF validation",
+            doGetBody.contains("processRequest("));
+    }
+
+    /**
+     * Unit test: generateAndStoreCsrfToken() must store the returned token
+     * in the session under CSRF_TOKEN_SESSION_ATTR.
+     */
+    @Test
+    public void generateAndStoreCsrfToken_storesTokenInSession() {
+        String token = Install.generateAndStoreCsrfToken(session);
+        assertNotNull("generateAndStoreCsrfToken() must return a non-null token", token);
+        assertFalse("Generated CSRF token must not be empty", token.isEmpty());
+        // Verify the token was stored in the session under the correct attribute key
+        verify(session).setAttribute(Install.CSRF_TOKEN_SESSION_ATTR, token);
+    }
+
+    /**
+     * Unit test: each call to generateAndStoreCsrfToken() must produce a
+     * different token, confirming the use of SecureRandom entropy.
+     */
+    @Test
+    public void generateAndStoreCsrfToken_producesUniqueTokens() {
+        // Use two independent mock sessions so setAttribute calls don't interfere
+        HttpSession session1 = mock(HttpSession.class);
+        HttpSession session2 = mock(HttpSession.class);
+
+        String token1 = Install.generateAndStoreCsrfToken(session1);
+        String token2 = Install.generateAndStoreCsrfToken(session2);
+
+        assertNotNull("First generated token must not be null", token1);
+        assertNotNull("Second generated token must not be null", token2);
+        assertNotEquals(
+            "Each call to generateAndStoreCsrfToken() must produce a unique token (SecureRandom entropy)",
+            token1, token2);
+    }
+
+    /**
+     * Unit test: generated CSRF token must be at least 32 characters long
+     * (256-bit token Base64-URL-encoded without padding → 43 chars).
+     * This confirms sufficient entropy to prevent brute-force guessing.
+     */
+    @Test
+    public void generateAndStoreCsrfToken_hasMinimumLength() {
+        HttpSession localSession = mock(HttpSession.class);
+        String token = Install.generateAndStoreCsrfToken(localSession);
+        assertNotNull("Generated CSRF token must not be null", token);
+        assertTrue(
+            "Generated CSRF token must be at least 32 characters long to ensure sufficient entropy; actual length: " + token.length(),
+            token.length() >= 32);
+    }
+
+    /**
+     * Unit test: the generated token must contain only Base64-URL-safe characters
+     * (A-Z, a-z, 0-9, '-', '_') and no padding characters ('=').
+     * This confirms the token can be safely embedded in an HTML form field.
+     */
+    @Test
+    public void generateAndStoreCsrfToken_tokenContainsOnlySafeChars() {
+        HttpSession localSession = mock(HttpSession.class);
+        String token = Install.generateAndStoreCsrfToken(localSession);
+        assertNotNull("Generated CSRF token must not be null", token);
+        assertTrue(
+            "Generated CSRF token must contain only Base64-URL-safe characters (no '+', '/', or '='): " + token,
+            token.matches("[A-Za-z0-9_-]+"));
+    }
+
+    /**
+     * Structural test: verify that doPost() does not contain any inline
+     * state-altering DB calls — it must delegate to processRequest() only
+     * after the CSRF check passes.
+     */
+    @Test
+    public void doPostDelegatesStateAlterationToProcessRequest() throws Exception {
+        String source = readInstallSource();
+        int doPostIdx = source.indexOf("protected void doPost(");
+        int getServletInfoIdx = source.indexOf("public String getServletInfo(");
+        if (doPostIdx < 0 || getServletInfoIdx < 0) {
+            org.junit.Assume.assumeTrue("doPost/getServletInfo not found in Install.java", false);
+            return;
+        }
+        String doPostBody = source.substring(doPostIdx, getServletInfoIdx);
+        // doPost must call processRequest() (after CSRF check passes)
+        assertTrue(
+            "doPost() must call processRequest() to delegate state-altering logic after CSRF validation",
+            doPostBody.contains("processRequest("));
+        // doPost must NOT call setup() or executeUpdate() directly
+        assertFalse(
+            "doPost() must NOT call setup() or executeUpdate() directly — state-altering logic belongs in processRequest()/setup()",
+            doPostBody.contains("setup(") || doPostBody.contains("executeUpdate("));
     }
 
     // -----------------------------------------------------------------------
