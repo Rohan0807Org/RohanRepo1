@@ -15,6 +15,7 @@ import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import org.owasp.encoder.Encode;
 
 /**
  *
@@ -52,7 +53,11 @@ public class AddPage extends HttpServlet {
                     BufferedWriter bw=new BufferedWriter(new FileWriter(f.getAbsoluteFile()));
                     bw.write(content);
                     bw.close();
-                    out.print("Successfully created the file: <a href='../pages/"+fileName+"'>"+fileName+"</a>");
+                    // Encode fileName for both the HTML attribute and HTML body contexts
+                    // to prevent Reflected XSS (CWE-79).
+                    out.print("Successfully created the file: <a href='../pages/"
+                        + Encode.forHtmlAttribute(fileName) + "'>"
+                        + Encode.forHtml(fileName) + "</a>");
                 }
                 else
                 {
